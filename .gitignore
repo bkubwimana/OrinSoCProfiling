@@ -54,7 +54,7 @@ cover/
 *.csv
 *.dat
 *.txt
-*nsys-req
+*nsys-rep
 *.qdstrm
 !requirements.txt 
 
