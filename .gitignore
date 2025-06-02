@@ -51,6 +51,14 @@ coverage.xml
 .pytest_cache/
 cover/
 
+*.csv
+*.dat
+*.txt
+*nsys-req
+*.qdstrm
+!requirements.txt 
+
+
 # Translations
 *.mo
 *.pot
