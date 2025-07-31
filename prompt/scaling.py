@@ -1,5 +1,4 @@
 import argparse
-import atexit
 import sys
 import os
 from tqdm import tqdm
@@ -11,6 +10,8 @@ from datasets import load_dataset, Dataset,get_dataset_config_names
 import torch
 import subprocess
 import signal
+from collections import Counter
+import random
 sys.path.append(os.path.join(os.getcwd(), "src"))
 
 from transformers import (
@@ -30,18 +31,10 @@ COLOR_INFO = "\033[94m"
 COLOR_DEBUG = "\033[93m"
 COLOR_RESULT = "\033[96m"
 COLOR_ERROR = "\033[91m"
-MAX_TOKENS = 4096
+MAX_TOKENS = 128
 
 # Global variables
 telemetry_proc: subprocess.Popen = None
-
-prompt_token_budget_list= []
-
-with open("token_budget.txt", "r") as f:
-    for line in f:
-        line = line.strip()
-        if line:
-            prompt_token_budget_list.append(int(line))
 
 
 def extract_predicted_choice(decoded_output: str) -> str:
@@ -143,99 +136,148 @@ def extract_predicted_choice(decoded_output: str) -> str:
         if full_match_start_index == 0 or not text[full_match_start_index - 1].isalpha():
             return match.group(1).upper()
 
+    text_upper = text.upper()
+    for char in ['A', 'B', 'C', 'D']:
+        if char in text_upper:
+            return char
+
     return "Invalid"
 
 
-def predict_local(tokenizer, model, messages, device, tokens=MAX_TOKENS):
+def majority_vote(answers):
+    """Perform majority voting on extracted answers, excluding Invalid responses"""
+    if not answers:
+        return "Invalid"
+    
+    # Filter out Invalid responses for voting
+    valid_answers = [ans for ans in answers if ans != "Invalid"]
+    
+    if not valid_answers:
+        return "Invalid"
+    
+    vote_counts = Counter(valid_answers)
+    most_common = vote_counts.most_common(1)
+    return most_common[0][0]
+
+
+def generate_multiple_samples(tokenizer, model, messages, device, num_samples=1, tokens=MAX_TOKENS, batch_size=4):
+    """Generate multiple samples for majority voting with batching"""
     tokenizer.chat_template = open("chat_deepseek.jinja").read()
     
     input_text = tokenizer.apply_chat_template(messages, tokenize=False)
     inputs = tokenizer(input_text, return_tensors="pt").to(device)
     
-    # ------------------------------------------------------------------ PREFILL
-    with nvtx.annotate("prefill"):
-        torch.cuda.synchronize()                  
-        prefill_start = time.perf_counter()
-
-        with torch.inference_mode():
-            _ = model(**inputs, use_cache=True)   
-
-        torch.cuda.synchronize()
-        prefill_ms = (time.perf_counter() - prefill_start) * 1e3
-
-    # ------------------------------------------------------------------ DECODE
-    with nvtx.annotate("decode"):
-        torch.cuda.synchronize()
-        decode_start = time.perf_counter()
-
-        outputs = model.generate(
-            **inputs,               
-            max_new_tokens=tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
-            temperature=None,
-            top_p=None,
-            top_k=None,
-        )
-
-        torch.cuda.synchronize()
-        gen_time_ms = (time.perf_counter() - decode_start) * 1e3
-        decode_ms = max(gen_time_ms - prefill_ms, 0.0)                     
-
-    # ------------------------------------------------------------------ post-proc
-    generated_token_ids = outputs[0][inputs["input_ids"].shape[1]:]
-    decoded_output     = tokenizer.decode(generated_token_ids,
-                                          skip_special_tokens=True).strip()
-    output_tokens      = generated_token_ids.size(0)
-    predicted_choice   = extract_predicted_choice(decoded_output)
-
-    return predicted_choice, decoded_output, (prefill_ms, decode_ms), output_tokens
-
-
-def terminate_telemetry_process():
-    """Function to directly kill the nvidia-smi process using its saved PID."""
-    global telemetry_proc
+    all_samples = []
+    all_latencies = []
+    total_tokens = 0
     
-    if telemetry_proc and telemetry_proc.poll() is None:
-        try:
-            telemetry_proc.terminate()
-            telemetry_proc.wait(timeout=2)
-        except:
-            pass
-    
-    pid_file = os.path.join(output_dir, "nvidia-smi.pid")
-    if os.path.exists(pid_file):
-        try:
-            with open(pid_file, 'r') as f:
-                pid = int(f.read().strip())
-            print(f"{COLOR_INFO}Killing nvidia-smi process with PID {pid}{COLOR_RESET}")
-            os.kill(pid, signal.SIGTERM)
-            time.sleep(1)
-            subprocess.run(["sudo", "kill", "-9", str(pid)], check=False)
-        except Exception as e:
-            print(f"{COLOR_ERROR}Error killing nvidia-smi: {e}{COLOR_RESET}")
-    
-    try:
-        subprocess.run(["sudo", "pkill", "-9", "nvidia-smi"], check=False)
-        subprocess.run(["sudo", "kill", "-9", "nvidia-smi"], check=False)
-    except:
-        pass
+    # Generate samples in batches
+    for batch_start in range(0, num_samples, batch_size):
+        current_batch_size = min(batch_size, num_samples - batch_start)
         
-    telemetry_proc = None
+        with nvtx.annotate(f"batch_generation_{batch_start}"):
+            torch.cuda.synchronize()
+            batch_start_time = time.perf_counter()
+            
+            with torch.inference_mode():
+                outputs = model.generate(
+                    **inputs,
+                    num_return_sequences=current_batch_size,
+                    max_new_tokens=tokens,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9,
+                    top_k=50,
+                    pad_token_id=tokenizer.eos_token_id,
+                    repetition_penalty=1.1
+                )
+            
+            torch.cuda.synchronize()
+            batch_time = (time.perf_counter() - batch_start_time) * 1e3
+            
+            batch_samples = []
+            for output in outputs:
+                generated_token_ids = output[inputs["input_ids"].shape[1]:]
+                decoded_output = tokenizer.decode(generated_token_ids, skip_special_tokens=True).strip()
+                batch_samples.append(decoded_output)
+                total_tokens += generated_token_ids.size(0)
+            
+            all_samples.extend(batch_samples)
+            all_latencies.append(batch_time)
+    
+    # Extract predicted choices from all samples
+    predicted_choices = [extract_predicted_choice(sample) for sample in all_samples]
+    
+    # Perform majority voting
+    final_choice = majority_vote(predicted_choices)
+    
+    # Calculate average latency
+    avg_latency = sum(all_latencies) / len(all_latencies) if all_latencies else 0
+    
+    return final_choice, all_samples, predicted_choices, avg_latency, total_tokens
+
+
+def predict_local(tokenizer, model, messages, device, num_samples=1, tokens=MAX_TOKENS):
+    """Enhanced prediction with majority voting support"""
+    if num_samples == 1:
+        # Single sample prediction (original behavior)
+        tokenizer.chat_template = open("chat_deepseek.jinja").read()
+        
+        input_text = tokenizer.apply_chat_template(messages, tokenize=False)
+        inputs = tokenizer(input_text, return_tensors="pt").to(device)
+        
+        with nvtx.annotate("single_generation"):
+            torch.cuda.synchronize()
+            start_time = time.perf_counter()
+            
+            with torch.inference_mode():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=tokens,
+                    do_sample=False,
+                    pad_token_id=tokenizer.eos_token_id,
+                    temperature=None,
+                    top_p=None,
+                    top_k=None,
+                )
+            
+            torch.cuda.synchronize()
+            total_time = (time.perf_counter() - start_time) * 1e3
+        
+        generated_token_ids = outputs[0][inputs["input_ids"].shape[1]:]
+        decoded_output = tokenizer.decode(generated_token_ids, skip_special_tokens=True).strip()
+        output_tokens = generated_token_ids.size(0)
+        predicted_choice = extract_predicted_choice(decoded_output)
+        
+        return predicted_choice, [decoded_output], [predicted_choice], (total_time, 0), output_tokens
+    
+    else:
+        # Multiple samples with majority voting
+        final_choice, all_samples, predicted_choices, avg_latency, total_tokens = generate_multiple_samples(
+            tokenizer, model, messages, device, num_samples, tokens
+        )
+        
+        return final_choice, all_samples, predicted_choices, (avg_latency, 0), total_tokens
 
 def start_telemetry_process():
     """Invoke tegrastats."""
-    telemetry_script = os.path.join(os.path.dirname(__file__), "telemetry.sh")
-    telemetry_proc = subprocess.Popen(["bash", telemetry_script], preexec_fn=os.setsid)
-    atexit.register(terminate_telemetry_process)
+    script = os.path.join(os.path.dirname(__file__), "telemetry.sh")
+    subprocess.run(["bash", script], check=True)
+    
+def terminate_telemetry_process():
+    """Stop the tegrastats daemon."""
+    subprocess.run(["sudo", "tegrastats", "--stop"], check=False)
+    subprocess.run(["sudo", "pkill", "-f", "tegrastats.*tegrastats.log"], check=False)
+    subprocess.run(["sudo", "tegrastats", "--stop"], check=False)
+    subprocess.run(["sudo", "kill", "-9", "tegrastats"])
+
 
 def main(args):
-    output_dir = "./outputs/profile/"
+    output_dir = "./outputs/tbudget/"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
     if args.all:
-
         subset_list = get_dataset_config_names("edinburgh-dawg/mmlu-redux")
     else:
         subset_list = [args.subset_name]
@@ -247,28 +289,18 @@ def main(args):
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         torch_dtype=torch.bfloat16,
-        device_map="cuda:1",
-        trust_remote_code=True,
-        attn_implementation="flash_attention_2"
+        device_map="cuda",
+        trust_remote_code=True
     )
     device = next(model.parameters()).device
     print(f"{COLOR_INFO}Model {args.model_name_or_path} loaded on device map: {model.hf_device_map}{COLOR_RESET}")
     
-
-    # start telemetry in its own group
-    
-    #============================================#
-    
-    print(f"{COLOR_INFO}Starting telemetry process...{COLOR_RESET}")
-
-    global telemetry_proc
-    telemetry_proc = start_telemetry_process()
-        
-    #============================================#
+    if args.num_samples > 1:
+        print(f"{COLOR_INFO}Test-time scaling enabled with {args.num_samples} samples per question{COLOR_RESET}")
     
     # Start NVTX range for all subsets
-    print("Pushing NVTX range: TimeCapture")    
-    
+    print("Pushing NVTX range: TimeCapture")
+    start_telemetry_process()
     nvtx.push_range(NVTX_RANGE_NAME)
     torch.cuda.synchronize()
     try:
@@ -277,15 +309,15 @@ def main(args):
             current_subset_name = subset
             
             safe_model_name = args.model_name_or_path.replace("/", "_")
-            log_file = os.path.join(output_dir, f"local_log_{safe_model_name}_{current_subset_name}_{args.num_questions}.txt")
-            results_file = os.path.join(output_dir, f"results_{safe_model_name}_{current_subset_name}_{args.num_questions}.csv")
+            log_file = os.path.join(output_dir, f"local_log_{safe_model_name}_{current_subset_name}_{args.num_questions}_samples{args.num_samples}.txt")
+            results_file = os.path.join(output_dir, f"results_{safe_model_name}_{current_subset_name}_{args.num_questions}_samples{args.num_samples}.csv")
 
             csv_file = open(results_file, 'w', newline='', encoding='utf-8')
             fieldnames = [
                 "subset", "question", "choices", "ground_truth_index",
                 "predicted_choice_letter", "predicted_index",
-                "full_output", "inference_time", "output_tokens",
-                "prefill", "decode"
+                "all_samples", "sample_predictions", "vote_counts",
+                "inference_time", "output_tokens", "num_samples"
             ]
             csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
             csv_writer.writeheader()
@@ -346,6 +378,7 @@ def main(args):
                         f"Choose the single best answer (A, B, C, or D) for the following question:\n\n"
                         f"Question: {item['question']}\n\n"
                         f"Choices:\n{choices_str}\n\n"
+                        f"Please limit your answer to at most {MAX_TOKENS} tokens.\n"
                         "Concisely, provide only the letter of the correct answer in the format:\n"
                         "Answer: <A/B/C/D>\n"
                     )
@@ -354,16 +387,26 @@ def main(args):
                         {"role": "user", "content": prompt_content},
                     ]
 
-                    predicted_choice_letter, full_decoded_output, latency, output_tokens = predict_local(tokenizer, model, messages, device, tokens=MAX_TOKENS)
+                    predicted_choice_letter, all_samples, sample_predictions, latency, output_tokens = predict_local(
+                        tokenizer, model, messages, device, 
+                        num_samples=args.num_samples, tokens=MAX_TOKENS
+                    )
                     inference_time = (latency[0] + latency[1]) / 1000
                     total_inference_time += inference_time
                     total_output_tokens += output_tokens
 
                     logf.write(f"\n--- Item {idx} ---\n")
                     logf.write("Prompt:\n" + prompt_content + "\n")
-                    logf.write("Full model output:\n" + full_decoded_output + "\n")
+                    if args.num_samples > 1:
+                        logf.write(f"All samples ({len(all_samples)}):\n")
+                        for i, sample in enumerate(all_samples):
+                            logf.write(f"  Sample {i+1}: {sample} -> {sample_predictions[i]}\n")
+                        logf.write(f"Vote counts: {dict(Counter(sample_predictions))}\n")
+                        logf.write(f"Majority vote: {predicted_choice_letter}\n")
+                    else:
+                        logf.write("Model output:\n" + all_samples[0] + "\n")
                     logf.write(f"Output Tokens: {output_tokens}\n")
-                    logf.write(f"Prefill Time: {latency[0]:.2f} ms, Decode Time: {latency[1]:.2f} ms\n")
+                    logf.write(f"Inference Time: {latency[0]:.2f} ms\n")
                     logf.flush()
 
                     ground_truth_index = item["answer"]
@@ -380,11 +423,12 @@ def main(args):
                         "ground_truth_index": ground_truth_index,
                         "predicted_choice_letter": predicted_choice_letter,
                         "predicted_index": predicted_index,
-                        "full_output": full_decoded_output,
-                        "prefill": latency[0],
-                        "decode": latency[1],
+                        "all_samples": all_samples,
+                        "sample_predictions": sample_predictions,
+                        "vote_counts": dict(Counter(sample_predictions)),
                         "inference_time": inference_time,
-                        "output_tokens": output_tokens
+                        "output_tokens": output_tokens,
+                        "num_samples": args.num_samples
                     })
                     csv_file.flush()
 
@@ -420,20 +464,17 @@ def main(args):
     finally:
         torch.cuda.synchronize()
         nvtx.pop_range()
-        
-        telemetry_proc.terminate()
         terminate_telemetry_process()
-        
         print("Popped NVTX range: TimeCapture")
         sys.stdout.flush()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate LLM on MMLU-Redux subset locally.")
+    parser = argparse.ArgumentParser(description="Evaluate LLM on MMLU-Redux subset with test-time scaling.")
     parser.add_argument(
         "--model_name_or_path",
         type=str,
-        default="deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+        default="deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
         help="Hugging Face model name or local path."
     )
     parser.add_argument(
@@ -447,6 +488,18 @@ if __name__ == "__main__":
         type=int,
         default=5,
         help="Number of questions to evaluate from the subset."
+    )
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=1,
+        help="Number of samples to generate per question for majority voting (test-time scaling)."
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=4,
+        help="Batch size for generating multiple samples."
     )
     parser.add_argument(
         "--config",
